@@ -93,8 +93,28 @@ function Get-RecentLaunchCount($state, [int]$windowSeconds) {
 }
 
 function Write-WrapLog([string]$msg) {
+    # Add-Content on Windows fails with IOException if any other process has
+    # the target file open without FILE_SHARE_WRITE — Git Bash's tail.exe,
+    # some antivirus mid-scan, and Windows Backup all do this. With the PS
+    # host running -WindowStyle Hidden we have no stderr, so a failed
+    # Add-Content would otherwise be silent and look like "wrapper running
+    # but not logging" on diagnosis. Retry briefly, then fall back to a
+    # sibling file so messages are not lost.
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Add-Content -Path $wrapperLog -Value "$ts  $msg"
+    $line = "$ts  $msg"
+    for ($i = 0; $i -lt 5; $i++) {
+        try {
+            Add-Content -Path $wrapperLog -Value $line -ErrorAction Stop
+            return
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 200
+        } catch {
+            break
+        }
+    }
+    try {
+        Add-Content -Path "$wrapperLog.fallback" -Value "$line  (written to fallback; primary log was locked)" -ErrorAction SilentlyContinue
+    } catch { }
 }
 
 function QuoteArg([string]$s) { '"' + ($s -replace '"','\"') + '"' }
