@@ -10,6 +10,7 @@ PowerShell wrapper that keeps `claude remote-control` running on Windows. Auto-l
 - Passes `--remote-control-session-name-prefix <HOSTNAME>-auto` so each launch gets a unique, collision-free session name in claude.ai/code.
 - Passes `--permission-mode auto` so the remote session doesn't stall on permission prompts.
 - Watches for `TCP:443 Established` and process lifetime; only marks a launch "healthy" after it survives several minutes.
+- **Detects and recycles "ghost" sessions** — a session that keeps a TCP:443 connection and keeps getting `200` from `/work/poll` while the *environment* it registered has been dropped server-side, so it is network-alive but invisible/unresponsive on claude.ai. Three coordinated defenses: (a) clears the bridge environment pointer before every launch so each session registers a brand-new environment instead of silently reusing a dead one; (b) watches `debug.log` for a *mid-session* environment reuse (the ghost signature) and recycles immediately; (c) a proactive max-lifetime recycle (default 6h) that bounds how long any undetected ghost can persist.
 - On unhealthy exits: exponential backoff (30s → 60s → 120s → ... → 900s).
 - After N consecutive unhealthy launches: writes a `lastGiveupAt` marker and exits cleanly so Task Scheduler's `RestartOnFailure` policy does not immediately relaunch. A persistent 30-minute cooldown is enforced across wrapper restarts.
 - Enforces a hard ceiling of 20 launches per rolling hour, independent of backoff, to defend against any bug that could bypass the exponential pacing.
@@ -107,6 +108,8 @@ All tuning knobs are script parameters — override them by editing the task act
 | `GiveupCooldownSeconds` | `1800` | Minimum idle window after a giveup, enforced across wrapper restarts. |
 | `MaxLaunchesPerHour` | `20` | Hard ceiling, enforced via the persistent launches list. Applies no matter what else the script does. |
 | `StallSeconds` | `120` | If TCP:443 drops for longer than this after the session was healthy, kill and relaunch. |
+| `MaxSessionLifetimeSeconds` | `21600` | Proactively recycle a session after this long (6h) even if it looks healthy, so a server-dropped environment can't strand it as a ghost. Set to `0` to disable. |
+| `GhostReuseGraceSeconds` | `60` | Ignore environment-reuse markers in `debug.log` within this many seconds of launch (they belong to the initial registration, not a ghost reconnect). |
 
 ## Logs and state
 
@@ -118,6 +121,8 @@ All in `~\.claude\remote-control-logs\`:
 - `child.pid` — PID of the current child, used for clean reaping on restart.
 - `state.json` — persistent `lastGiveupAt` timestamp and rolling list of launch timestamps. Delete to reset all rate-limit state.
 
+The wrapper also moves the CLI's bridge environment pointer (`~\.claude\projects\<encoded-cwd>\bridge-pointer.json`) to `bridge-pointer.json.prev` before each launch, forcing a fresh environment registration.
+
 ## Troubleshooting
 
 **Wrapper starts but child dies within ~15s, `output.err` says `Error: timeout of 15000ms exceeded`.** The CLI's POST to `/v1/environments/bridge` is timing out. If this was preceded by many failed launches, you've likely tripped server-side rate limiting on new bridge registrations — wait 20-30 minutes and the wrapper's backoff + `GiveupCooldownSeconds` cooldown will handle the rest.
@@ -125,6 +130,8 @@ All in `~\.claude\remote-control-logs\`:
 **Wrapper logs `FATAL: node.exe not at ...` or `FATAL: cli.js not at ...`.** Edit the hard-coded paths near the top of `remote-control-wrapper.ps1` to match your install, or install Node.js / `@anthropic-ai/claude-code` in the default locations.
 
 **`claude remote-control` launches but the machine never shows up at claude.ai/code.** Usually either (a) your account isn't signed in under this Windows user profile — run `claude` interactively once to confirm, or (b) the CLI never successfully registered because the bridge-registration call is failing — check `debug.log` for `[bridge:api]` entries.
+
+**The session shows as connected locally (`wrapper.log` says healthy, `debug.log` shows `/work/poll -> 200`) but it's missing or unresponsive at claude.ai/code.** This is a "ghost" session — the environment it registered was dropped server-side but the client keeps polling it. Look in `debug.log` for `[bridge:init] Found prior environment ... requesting reuse on registration` appearing *after* a launch. The wrapper now detects this and recycles automatically (`GHOST: detected mid-session environment reuse` in `wrapper.log`), and clears the bridge pointer before each launch so it can't recur. To force a clean session immediately, restart the task: `Stop-ScheduledTask -TaskName 'ClaudeRemoteControl'; Start-ScheduledTask -TaskName 'ClaudeRemoteControl'` (note the CLI child is detached, so the running wrapper reaps the old PID from `child.pid` on its next loop).
 
 **Everything looks fine but a scheduled reboot doesn't bring the session back.** Task Scheduler's `AtLogOn` trigger requires the user to actually be logged in. For unattended-boot recovery (e.g. power outage on a headless machine), enable Windows auto-login via `netplwiz` (uncheck "Users must enter a username and password to use this computer…" and enter your password when prompted). The scheduled task fires as soon as auto-login completes.
 

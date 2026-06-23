@@ -14,6 +14,18 @@ param(
     # work. A multi-minute floor on "healthy" prevents the wrapper from
     # resetting its quickExitCount too early and drifting into a crash-loop.
     [int]$HealthyLifetimeSeconds     = 300,
+    # Proactively recycle a session after this long even if it looks healthy.
+    # A remote-control session can keep a TCP:443 connection open and keep
+    # getting HTTP 200 from /work/poll while the *environment* it registered
+    # has been dropped server-side — a "ghost" that is network-alive but
+    # invisible/unresponsive on claude.ai. Recycling on a fixed lifetime
+    # bounds how long such a ghost can persist and keeps the registration
+    # fresh. Set to 0 to disable.
+    [int]$MaxSessionLifetimeSeconds  = 21600,
+    # When detecting a mid-session environment *reuse* (the signature of a
+    # ghost re-registration), ignore reuse markers within this many seconds
+    # of launch — they belong to the initial registration, not a reconnect.
+    [int]$GhostReuseGraceSeconds     = 60,
     [int]$MaxConsecutiveFailures     = 8,
     # Hard per-hour ceiling on launches, enforced across wrapper restarts
     # via a persisted history file. Independent of the exponential backoff
@@ -42,6 +54,15 @@ $debugLog   = Join-Path $logDir 'debug.log'
 # can reap it without touching unrelated `/remote-control` sessions the
 # user may have started interactively from the same machine.
 $pidFile = Join-Path $logDir 'child.pid'
+
+# The bridge pointer records the last environment id so a restarted session
+# can re-register under the same environment. Reusing a *live* environment is
+# fine, but reusing one the server has already dropped is exactly how a
+# session becomes a ghost (keeps polling 200 but is invisible on claude.ai).
+# We clear this before every launch so each session registers fresh. Derived
+# from the working dir ($env:USERPROFILE) the same way the CLI encodes project
+# dirs: replace ':' and '\' with '-'.
+$bridgePointer = Join-Path $env:USERPROFILE (".claude\projects\" + ($env:USERPROFILE -replace '[:\\]','-') + "\bridge-pointer.json")
 
 # Persistent state so launch-rate and giveup decisions survive a wrapper
 # crash or a Task-Scheduler-driven restart. Without this, each new
@@ -144,6 +165,41 @@ function Kill-PidFromFile {
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
 }
 
+function Clear-BridgePointer {
+    # Remove the stale environment pointer so the next launch registers a
+    # fresh environment instead of reusing one that may already be dead.
+    if (Test-Path $bridgePointer) {
+        try {
+            Move-Item -Force $bridgePointer "$bridgePointer.prev" -ErrorAction Stop
+            Write-WrapLog "Cleared bridge pointer (forcing fresh environment registration)"
+        } catch {
+            Write-WrapLog "Warning: could not clear bridge pointer: $_"
+        }
+    }
+}
+
+function Test-GhostReuse {
+    # A ghost session re-registers mid-flight by reusing a prior environment.
+    # Because we clear the pointer before launch, the only way a reuse marker
+    # appears after $afterUtc is an in-process reconnect onto a (possibly
+    # dead) environment — treat that as a ghost and signal a recycle.
+    param([datetime]$afterUtc)
+    if (-not (Test-Path $debugLog)) { return $false }
+    try {
+        $tail = Get-Content $debugLog -Tail 60 -ErrorAction Stop
+    } catch { return $false }
+    foreach ($line in $tail) {
+        if ($line -notmatch 'Found prior environment|requesting reuse on registration') { continue }
+        if ($line -match '^(?<ts>\d{4}-\d{2}-\d{2}T[\d:.]+Z)') {
+            try {
+                $ts = [DateTime]::Parse($matches.ts).ToUniversalTime()
+                if ($ts -gt $afterUtc) { return $true }
+            } catch {}
+        }
+    }
+    return $false
+}
+
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
     try {
         $pf = $using:pidFile
@@ -212,8 +268,13 @@ while ($true) {
         '--debug-file', (QuoteArg $debugLog)
     )
 
+    # Force a fresh environment registration each launch so a server-dropped
+    # environment can never be silently reused into a ghost session.
+    Clear-BridgePointer
+
     Write-WrapLog "Launching (attempt, quickExitCount=$quickExitCount, lastHour=$recentCount): $nodeExe $($argList -join ' ')"
     $launchTime = Get-Date
+    $launchTimeUtc = $launchTime.ToUniversalTime()
     # Record the launch in persistent state BEFORE starting, so even a
     # crash between Start-Process and the state write cannot under-count.
     $state.launches = @(@($state.launches) + $launchTime.ToUniversalTime().ToString('o'))
@@ -263,6 +324,26 @@ while ($true) {
                 $reason = "stalled-${since}s"
                 break
             }
+        }
+
+        # Ghost detection: an in-process environment reuse after launch means
+        # the session reconnected onto a (possibly dead) environment and may
+        # now be polling 200 while invisible on claude.ai. Recycle it so the
+        # next launch registers cleanly from scratch.
+        if (Test-GhostReuse -afterUtc $launchTimeUtc.AddSeconds($GhostReuseGraceSeconds)) {
+            Write-WrapLog "GHOST: detected mid-session environment reuse -> killing PID $($proc.Id) to re-register fresh"
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+            $reason = "ghost-reuse"
+            break
+        }
+
+        # Proactive lifetime recycle: bounds how long any undetected ghost can
+        # persist and keeps the environment registration fresh.
+        if ($MaxSessionLifetimeSeconds -gt 0 -and $aliveSeconds -ge $MaxSessionLifetimeSeconds) {
+            Write-WrapLog "RECYCLE: session lived ${aliveSeconds}s (>= ${MaxSessionLifetimeSeconds}s) -> killing PID $($proc.Id) for fresh registration"
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+            $reason = "lifetime-recycle"
+            break
         }
     }
 
