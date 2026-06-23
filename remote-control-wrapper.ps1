@@ -14,14 +14,17 @@ param(
     # work. A multi-minute floor on "healthy" prevents the wrapper from
     # resetting its quickExitCount too early and drifting into a crash-loop.
     [int]$HealthyLifetimeSeconds     = 300,
-    # Proactively recycle a session after this long even if it looks healthy.
-    # A remote-control session can keep a TCP:443 connection open and keep
-    # getting HTTP 200 from /work/poll while the *environment* it registered
-    # has been dropped server-side — a "ghost" that is network-alive but
-    # invisible/unresponsive on claude.ai. Recycling on a fixed lifetime
-    # bounds how long such a ghost can persist and keeps the registration
-    # fresh. Set to 0 to disable.
-    [int]$MaxSessionLifetimeSeconds  = 21600,
+    # Optional belt-and-suspenders recycle for a ghost that the primary
+    # detector (below) somehow misses: recycle a session once it has lived
+    # this long AND has been idle (see IdleRecycleSeconds) — never while a
+    # conversation is in flight, so an active mobile/web session is not
+    # killed out from under you. Disabled by default (0) because the offset-
+    # based reuse detector is the real defense; enable it only if you want a
+    # hard ceiling on session age.
+    [int]$MaxSessionLifetimeSeconds  = 0,
+    # A session is considered idle (and therefore safe to recycle) when no
+    # bridge transcript has been written for this many seconds.
+    [int]$IdleRecycleSeconds         = 600,
     # When detecting a mid-session environment *reuse* (the signature of a
     # ghost re-registration), ignore reuse markers within this many seconds
     # of launch — they belong to the initial registration, not a reconnect.
@@ -152,6 +155,11 @@ Write-WrapLog "wrapper starting (SessionNamePrefix='$SessionNamePrefix' Permissi
 if (-not (Test-Path $nodeExe)) { Write-WrapLog "FATAL: node.exe not at $nodeExe"; exit 1 }
 if (-not (Test-Path $cliJs))   { Write-WrapLog "FATAL: cli.js not at $cliJs";   exit 1 }
 
+# Log the resolved bridge-pointer path once so a wrong path assumption (e.g.
+# a future CLI changing where it writes the pointer) is diagnosable rather
+# than a silent no-op. We re-verify after the first healthy session below.
+Write-WrapLog "Bridge pointer path: $bridgePointer (exists=$(Test-Path $bridgePointer))"
+
 function Kill-PidFromFile {
     if (-not (Test-Path $pidFile)) { return }
     try {
@@ -178,26 +186,47 @@ function Clear-BridgePointer {
     }
 }
 
-function Test-GhostReuse {
-    # A ghost session re-registers mid-flight by reusing a prior environment.
-    # Because we clear the pointer before launch, the only way a reuse marker
-    # appears after $afterUtc is an in-process reconnect onto a (possibly
-    # dead) environment — treat that as a ghost and signal a recycle.
-    param([datetime]$afterUtc)
-    if (-not (Test-Path $debugLog)) { return $false }
+function Read-AppendedText {
+    # Read everything appended to a file since byte offset $Offset and return
+    # the new text plus the new offset. Tracking an offset (rather than a
+    # fixed `-Tail N`) means a one-time marker can never scroll out of a
+    # window before we see it, no matter how much other output is written
+    # between checks. Opened share-read/write so we don't block the writer.
+    # If the file shrank since last read (rotation/truncation), restart at 0.
+    param([string]$Path, [long]$Offset)
+    $out = @{ Text = ''; Offset = $Offset }
+    if (-not (Test-Path $Path)) { return $out }
     try {
-        $tail = Get-Content $debugLog -Tail 60 -ErrorAction Stop
-    } catch { return $false }
-    foreach ($line in $tail) {
-        if ($line -notmatch 'Found prior environment|requesting reuse on registration') { continue }
-        if ($line -match '^(?<ts>\d{4}-\d{2}-\d{2}T[\d:.]+Z)') {
-            try {
-                $ts = [DateTime]::Parse($matches.ts).ToUniversalTime()
-                if ($ts -gt $afterUtc) { return $true }
-            } catch {}
-        }
-    }
-    return $false
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            if ($fs.Length -lt $Offset) { $Offset = 0 }
+            $null = $fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+            $sr = New-Object System.IO.StreamReader($fs)
+            $out.Text   = $sr.ReadToEnd()
+            $out.Offset = $fs.Position
+        } finally { $fs.Dispose() }
+    } catch {}
+    return $out
+}
+
+function Test-ReuseMarker([string]$text) {
+    # The ghost signature. We scan only text appended *after* this launch (via
+    # the offset cursor) and after the grace window, so any occurrence here is
+    # by definition a mid-session reconnect — no per-line timestamp parsing
+    # required, which avoids coupling to the exact --debug-file line format.
+    return ($text -match 'Found prior environment|requesting reuse on registration')
+}
+
+function Get-NewestTranscriptAge {
+    # Seconds since the most recently written bridge transcript. Conversations
+    # write transcripts, so a large value means the session is idle and safe
+    # to recycle. Returns [int]::MaxValue when there is no transcript at all.
+    try {
+        $t = Get-ChildItem (Join-Path $logDir 'bridge-transcript-*.jsonl') -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $t) { return [int]::MaxValue }
+        return [int]((Get-Date) - $t.LastWriteTime).TotalSeconds
+    } catch { return [int]::MaxValue }
 }
 
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
@@ -274,7 +303,6 @@ while ($true) {
 
     Write-WrapLog "Launching (attempt, quickExitCount=$quickExitCount, lastHour=$recentCount): $nodeExe $($argList -join ' ')"
     $launchTime = Get-Date
-    $launchTimeUtc = $launchTime.ToUniversalTime()
     # Record the launch in persistent state BEFORE starting, so even a
     # crash between Start-Process and the state write cannot under-count.
     $state.launches = @(@($state.launches) + $launchTime.ToUniversalTime().ToString('o'))
@@ -302,6 +330,11 @@ while ($true) {
     $everHealthy  = $false
     $graceUntil   = (Get-Date).AddSeconds($GraceSeconds)
     $reason       = $null
+    # Start the ghost scan at the current end of debug.log so we only ever
+    # inspect output this launch appends, and advance it every iteration so a
+    # marker can't scroll past us between checks.
+    $ghostOffset  = if (Test-Path $debugLog) { (Get-Item $debugLog).Length } else { 0 }
+    $pointerWarned = $false
 
     while (-not $proc.HasExited) {
         Start-Sleep -Seconds 15
@@ -313,6 +346,14 @@ while ($true) {
             if (-not $everHealthy -and $aliveSeconds -ge $HealthyLifetimeSeconds) {
                 Write-WrapLog "Healthy: TCP:443 established and process lived ${aliveSeconds}s for PID $($proc.Id)"
                 $everHealthy = $true
+                # By now a registered session should have written its pointer.
+                # If it hasn't at the path we derived, our assumption about the
+                # CLI's pointer location is likely wrong and Clear-BridgePointer
+                # is a silent no-op -- surface that once so it's diagnosable.
+                if (-not $pointerWarned -and -not (Test-Path $bridgePointer)) {
+                    Write-WrapLog "Warning: no bridge pointer at $bridgePointer after session became healthy; fresh-registration defense may be inert (CLI pointer path may have changed)."
+                    $pointerWarned = $true
+                }
             }
         }
 
@@ -326,24 +367,33 @@ while ($true) {
             }
         }
 
-        # Ghost detection: an in-process environment reuse after launch means
-        # the session reconnected onto a (possibly dead) environment and may
-        # now be polling 200 while invisible on claude.ai. Recycle it so the
-        # next launch registers cleanly from scratch.
-        if (Test-GhostReuse -afterUtc $launchTimeUtc.AddSeconds($GhostReuseGraceSeconds)) {
+        # Ghost detection (primary defense): scan everything debug.log has
+        # appended since the last check for a mid-session environment reuse --
+        # the signature of a session reconnecting onto a (possibly dead)
+        # environment and polling 200 while invisible on claude.ai. The offset
+        # cursor guarantees no marker is missed regardless of log volume. We
+        # always advance the cursor, but only act once past the grace window
+        # (so the initial registration's own output is never misread).
+        $appended = Read-AppendedText -Path $debugLog -Offset $ghostOffset
+        $ghostOffset = $appended.Offset
+        if ($aliveSeconds -ge $GhostReuseGraceSeconds -and (Test-ReuseMarker $appended.Text)) {
             Write-WrapLog "GHOST: detected mid-session environment reuse -> killing PID $($proc.Id) to re-register fresh"
             try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
             $reason = "ghost-reuse"
             break
         }
 
-        # Proactive lifetime recycle: bounds how long any undetected ghost can
-        # persist and keeps the environment registration fresh.
+        # Optional lifetime cap (off by default): a blunt fallback for a ghost
+        # the detector somehow missed. Idle-gated so it never kills a session
+        # with a conversation in flight.
         if ($MaxSessionLifetimeSeconds -gt 0 -and $aliveSeconds -ge $MaxSessionLifetimeSeconds) {
-            Write-WrapLog "RECYCLE: session lived ${aliveSeconds}s (>= ${MaxSessionLifetimeSeconds}s) -> killing PID $($proc.Id) for fresh registration"
-            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
-            $reason = "lifetime-recycle"
-            break
+            $idleFor = Get-NewestTranscriptAge
+            if ($idleFor -ge $IdleRecycleSeconds) {
+                Write-WrapLog "RECYCLE: session lived ${aliveSeconds}s and idle ${idleFor}s -> killing PID $($proc.Id) for fresh registration"
+                try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                $reason = "lifetime-recycle"
+                break
+            }
         }
     }
 
@@ -355,14 +405,21 @@ while ($true) {
     }
     $lifetime = [int]((Get-Date) - $launchTime).TotalSeconds
 
-    if ($everHealthy) {
+    # A recycle we initiated on purpose (ghost re-registration or the idle
+    # lifetime cap) is not a failure -- relaunching is the whole point -- so it
+    # must not feed the backoff/giveup counters even when it fires before the
+    # 300s healthy threshold. The MaxLaunchesPerHour ceiling still bounds a
+    # pathological reuse-then-ghost loop.
+    $intentionalRecycle = ($reason -eq 'ghost-reuse' -or $reason -eq 'lifetime-recycle')
+
+    if ($everHealthy -or $intentionalRecycle) {
         if ($quickExitCount -gt 0) { Write-WrapLog "Resetting quickExitCount (was $quickExitCount)" }
         $quickExitCount = 0
     } else {
         $quickExitCount++
     }
 
-    $cooldown = if ($everHealthy) {
+    $cooldown = if ($everHealthy -or $intentionalRecycle) {
         $BaseCooldownSeconds
     } else {
         [Math]::Min($BaseCooldownSeconds * [Math]::Pow(2, $quickExitCount - 1), $MaxCooldownSeconds)
