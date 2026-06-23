@@ -10,7 +10,7 @@ PowerShell wrapper that keeps `claude remote-control` running on Windows. Auto-l
 - Passes `--remote-control-session-name-prefix <HOSTNAME>-auto` so each launch gets a unique, collision-free session name in claude.ai/code.
 - Passes `--permission-mode auto` so the remote session doesn't stall on permission prompts.
 - Watches for `TCP:443 Established` and process lifetime; only marks a launch "healthy" after it survives several minutes.
-- **Detects and recycles "ghost" sessions** — a session that keeps a TCP:443 connection and keeps getting `200` from `/work/poll` while the *environment* it registered has been dropped server-side, so it is network-alive but invisible/unresponsive on claude.ai. Three coordinated defenses: (a) clears the bridge environment pointer before every launch so each session registers a brand-new environment instead of silently reusing a dead one; (b) watches `debug.log` for a *mid-session* environment reuse (the ghost signature) and recycles immediately; (c) a proactive max-lifetime recycle (default 6h) that bounds how long any undetected ghost can persist.
+- **Detects and recycles "ghost" sessions** — a session that keeps a TCP:443 connection and keeps getting `200` from `/work/poll` while the *environment* it registered has been dropped server-side, so it is network-alive but invisible/unresponsive on claude.ai. Two always-on defenses plus an optional fallback: (a) clears the bridge environment pointer before every launch so each session registers a brand-new environment instead of silently reusing a dead one; (b) the primary detector watches `debug.log` for a *mid-session* environment reuse (the ghost signature) using an **offset-based incremental scan** — it tracks a byte cursor rather than a fixed tail window, so a one-time marker can never scroll out of view before it's seen, and recycles immediately; (c) an **optional, off-by-default** lifetime cap (`MaxSessionLifetimeSeconds`) that recycles only when the session is also *idle*, so it never kills a conversation in flight.
 - On unhealthy exits: exponential backoff (30s → 60s → 120s → ... → 900s).
 - After N consecutive unhealthy launches: writes a `lastGiveupAt` marker and exits cleanly so Task Scheduler's `RestartOnFailure` policy does not immediately relaunch. A persistent 30-minute cooldown is enforced across wrapper restarts.
 - Enforces a hard ceiling of 20 launches per rolling hour, independent of backoff, to defend against any bug that could bypass the exponential pacing.
@@ -23,6 +23,10 @@ PowerShell wrapper that keeps `claude remote-control` running on Windows. Auto-l
 - You have already run `claude` once in the directory you want to control, accepted the workspace trust dialog, and signed in with a subscription-bearing account. The OAuth token is stored in your user profile and must be present for `remote-control` to boot.
 
 ## Install
+
+[![Install with Claude](https://img.shields.io/badge/Install%20with-Claude-d97706?style=for-the-badge)](https://bensheed.github.io/claude-remote-autostart/install-ux/index.html)
+
+The badge above hands this repo to Claude Code (or Claude Desktop) and asks it to install and set everything up for you. Or follow the manual steps below.
 
 ### 1. Drop the script
 
@@ -108,7 +112,8 @@ All tuning knobs are script parameters — override them by editing the task act
 | `GiveupCooldownSeconds` | `1800` | Minimum idle window after a giveup, enforced across wrapper restarts. |
 | `MaxLaunchesPerHour` | `20` | Hard ceiling, enforced via the persistent launches list. Applies no matter what else the script does. |
 | `StallSeconds` | `120` | If TCP:443 drops for longer than this after the session was healthy, kill and relaunch. |
-| `MaxSessionLifetimeSeconds` | `21600` | Proactively recycle a session after this long (6h) even if it looks healthy, so a server-dropped environment can't strand it as a ghost. Set to `0` to disable. |
+| `MaxSessionLifetimeSeconds` | `0` (off) | Optional fallback recycle for a ghost the detector somehow misses. When set, a session is recycled once it has lived this long **and** is idle (see `IdleRecycleSeconds`). Off by default — the offset-based reuse detector is the real defense, and a fixed-clock kill would otherwise risk interrupting an active session. |
+| `IdleRecycleSeconds` | `600` | How long with no bridge-transcript activity before a session counts as idle (and therefore safe for the lifetime cap to recycle). |
 | `GhostReuseGraceSeconds` | `60` | Ignore environment-reuse markers in `debug.log` within this many seconds of launch (they belong to the initial registration, not a ghost reconnect). |
 
 ## Logs and state
