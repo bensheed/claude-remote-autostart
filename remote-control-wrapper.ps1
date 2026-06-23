@@ -218,15 +218,22 @@ function Test-ReuseMarker([string]$text) {
 }
 
 function Get-NewestTranscriptAge {
-    # Seconds since the most recently written bridge transcript. Conversations
-    # write transcripts, so a large value means the session is idle and safe
-    # to recycle. Returns [int]::MaxValue when there is no transcript at all.
+    # Seconds since the most recently written bridge transcript, used as the
+    # idle signal for the lifetime cap. The CLI writes bridge-transcript-*.jsonl
+    # next to its --debug-file (i.e. into $logDir), confirmed via the
+    # "Transcript log: ..." line it emits on session spawn.
+    #
+    # Returns -1 ("activity unknown") when no transcript is found or the lookup
+    # fails. This FAILS CLOSED: the caller must not recycle on -1, so a wrong
+    # path or a transient error can never be misread as "maximally idle, safe
+    # to kill" -- which would reintroduce the active-session-kill this gate
+    # exists to prevent.
     try {
-        $t = Get-ChildItem (Join-Path $logDir 'bridge-transcript-*.jsonl') -ErrorAction SilentlyContinue |
+        $t = Get-ChildItem (Join-Path $logDir 'bridge-transcript-*.jsonl') -ErrorAction Stop |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if (-not $t) { return [int]::MaxValue }
+        if (-not $t) { return -1 }
         return [int]((Get-Date) - $t.LastWriteTime).TotalSeconds
-    } catch { return [int]::MaxValue }
+    } catch { return -1 }
 }
 
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
@@ -335,6 +342,7 @@ while ($true) {
     # marker can't scroll past us between checks.
     $ghostOffset  = if (Test-Path $debugLog) { (Get-Item $debugLog).Length } else { 0 }
     $pointerWarned = $false
+    $idleUnknownWarned = $false
 
     while (-not $proc.HasExited) {
         Start-Sleep -Seconds 15
@@ -388,7 +396,15 @@ while ($true) {
         # with a conversation in flight.
         if ($MaxSessionLifetimeSeconds -gt 0 -and $aliveSeconds -ge $MaxSessionLifetimeSeconds) {
             $idleFor = Get-NewestTranscriptAge
-            if ($idleFor -ge $IdleRecycleSeconds) {
+            if ($idleFor -lt 0) {
+                # Activity unknown -> fail closed (do not recycle). Warn once so
+                # a wrong/empty transcript path is diagnosable rather than
+                # silently disabling the cap.
+                if (-not $idleUnknownWarned) {
+                    Write-WrapLog "Lifetime cap reached (${aliveSeconds}s) but no transcript activity observable in $logDir; failing closed (not recycling)."
+                    $idleUnknownWarned = $true
+                }
+            } elseif ($idleFor -ge $IdleRecycleSeconds) {
                 Write-WrapLog "RECYCLE: session lived ${aliveSeconds}s and idle ${idleFor}s -> killing PID $($proc.Id) for fresh registration"
                 try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
                 $reason = "lifetime-recycle"
@@ -405,21 +421,24 @@ while ($true) {
     }
     $lifetime = [int]((Get-Date) - $launchTime).TotalSeconds
 
-    # A recycle we initiated on purpose (ghost re-registration or the idle
-    # lifetime cap) is not a failure -- relaunching is the whole point -- so it
-    # must not feed the backoff/giveup counters even when it fires before the
-    # 300s healthy threshold. The MaxLaunchesPerHour ceiling still bounds a
-    # pathological reuse-then-ghost loop.
-    $intentionalRecycle = ($reason -eq 'ghost-reuse' -or $reason -eq 'lifetime-recycle')
+    # When a recycle/exit should NOT count toward backoff+giveup:
+    #  - the session had become healthy (a working session whose environment
+    #    was later dropped just needs to re-register -- relaunch promptly), or
+    #  - the idle lifetime cap fired (only ever past the healthy threshold).
+    # A ghost-reuse that fires *before* the session was ever healthy is treated
+    # as a real failure: it accrues quickExitCount, so a deterministically
+    # ghosting (broken) environment escalates to the GIVING UP cooldown instead
+    # of relaunching at the hourly ceiling forever.
+    $noPenaltyExit = $everHealthy -or ($reason -eq 'lifetime-recycle')
 
-    if ($everHealthy -or $intentionalRecycle) {
+    if ($noPenaltyExit) {
         if ($quickExitCount -gt 0) { Write-WrapLog "Resetting quickExitCount (was $quickExitCount)" }
         $quickExitCount = 0
     } else {
         $quickExitCount++
     }
 
-    $cooldown = if ($everHealthy -or $intentionalRecycle) {
+    $cooldown = if ($noPenaltyExit) {
         $BaseCooldownSeconds
     } else {
         [Math]::Min($BaseCooldownSeconds * [Math]::Pow(2, $quickExitCount - 1), $MaxCooldownSeconds)
