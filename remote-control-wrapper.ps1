@@ -14,6 +14,21 @@ param(
     # work. A multi-minute floor on "healthy" prevents the wrapper from
     # resetting its quickExitCount too early and drifting into a crash-loop.
     [int]$HealthyLifetimeSeconds     = 300,
+    # Optional belt-and-suspenders recycle for a ghost that the primary
+    # detector (below) somehow misses: recycle a session once it has lived
+    # this long AND has been idle (see IdleRecycleSeconds) — never while a
+    # conversation is in flight, so an active mobile/web session is not
+    # killed out from under you. Disabled by default (0) because the offset-
+    # based reuse detector is the real defense; enable it only if you want a
+    # hard ceiling on session age.
+    [int]$MaxSessionLifetimeSeconds  = 0,
+    # A session is considered idle (and therefore safe to recycle) when no
+    # bridge transcript has been written for this many seconds.
+    [int]$IdleRecycleSeconds         = 600,
+    # When detecting a mid-session environment *reuse* (the signature of a
+    # ghost re-registration), ignore reuse markers within this many seconds
+    # of launch — they belong to the initial registration, not a reconnect.
+    [int]$GhostReuseGraceSeconds     = 60,
     [int]$MaxConsecutiveFailures     = 8,
     # Hard per-hour ceiling on launches, enforced across wrapper restarts
     # via a persisted history file. Independent of the exponential backoff
@@ -42,6 +57,15 @@ $debugLog   = Join-Path $logDir 'debug.log'
 # can reap it without touching unrelated `/remote-control` sessions the
 # user may have started interactively from the same machine.
 $pidFile = Join-Path $logDir 'child.pid'
+
+# The bridge pointer records the last environment id so a restarted session
+# can re-register under the same environment. Reusing a *live* environment is
+# fine, but reusing one the server has already dropped is exactly how a
+# session becomes a ghost (keeps polling 200 but is invisible on claude.ai).
+# We clear this before every launch so each session registers fresh. Derived
+# from the working dir ($env:USERPROFILE) the same way the CLI encodes project
+# dirs: replace ':' and '\' with '-'.
+$bridgePointer = Join-Path $env:USERPROFILE (".claude\projects\" + ($env:USERPROFILE -replace '[:\\]','-') + "\bridge-pointer.json")
 
 # Persistent state so launch-rate and giveup decisions survive a wrapper
 # crash or a Task-Scheduler-driven restart. Without this, each new
@@ -131,6 +155,11 @@ Write-WrapLog "wrapper starting (SessionNamePrefix='$SessionNamePrefix' Permissi
 if (-not (Test-Path $nodeExe)) { Write-WrapLog "FATAL: node.exe not at $nodeExe"; exit 1 }
 if (-not (Test-Path $cliJs))   { Write-WrapLog "FATAL: cli.js not at $cliJs";   exit 1 }
 
+# Log the resolved bridge-pointer path once so a wrong path assumption (e.g.
+# a future CLI changing where it writes the pointer) is diagnosable rather
+# than a silent no-op. We re-verify after the first healthy session below.
+Write-WrapLog "Bridge pointer path: $bridgePointer (exists=$(Test-Path $bridgePointer))"
+
 function Kill-PidFromFile {
     if (-not (Test-Path $pidFile)) { return }
     try {
@@ -142,6 +171,69 @@ function Kill-PidFromFile {
         Stop-Process -Id $stalePid -Force -ErrorAction SilentlyContinue
     }
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+}
+
+function Clear-BridgePointer {
+    # Remove the stale environment pointer so the next launch registers a
+    # fresh environment instead of reusing one that may already be dead.
+    if (Test-Path $bridgePointer) {
+        try {
+            Move-Item -Force $bridgePointer "$bridgePointer.prev" -ErrorAction Stop
+            Write-WrapLog "Cleared bridge pointer (forcing fresh environment registration)"
+        } catch {
+            Write-WrapLog "Warning: could not clear bridge pointer: $_"
+        }
+    }
+}
+
+function Read-AppendedText {
+    # Read everything appended to a file since byte offset $Offset and return
+    # the new text plus the new offset. Tracking an offset (rather than a
+    # fixed `-Tail N`) means a one-time marker can never scroll out of a
+    # window before we see it, no matter how much other output is written
+    # between checks. Opened share-read/write so we don't block the writer.
+    # If the file shrank since last read (rotation/truncation), restart at 0.
+    param([string]$Path, [long]$Offset)
+    $out = @{ Text = ''; Offset = $Offset }
+    if (-not (Test-Path $Path)) { return $out }
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            if ($fs.Length -lt $Offset) { $Offset = 0 }
+            $null = $fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+            $sr = New-Object System.IO.StreamReader($fs)
+            $out.Text   = $sr.ReadToEnd()
+            $out.Offset = $fs.Position
+        } finally { $fs.Dispose() }
+    } catch {}
+    return $out
+}
+
+function Test-ReuseMarker([string]$text) {
+    # The ghost signature. We scan only text appended *after* this launch (via
+    # the offset cursor) and after the grace window, so any occurrence here is
+    # by definition a mid-session reconnect — no per-line timestamp parsing
+    # required, which avoids coupling to the exact --debug-file line format.
+    return ($text -match 'Found prior environment|requesting reuse on registration')
+}
+
+function Get-NewestTranscriptAge {
+    # Seconds since the most recently written bridge transcript, used as the
+    # idle signal for the lifetime cap. The CLI writes bridge-transcript-*.jsonl
+    # next to its --debug-file (i.e. into $logDir), confirmed via the
+    # "Transcript log: ..." line it emits on session spawn.
+    #
+    # Returns -1 ("activity unknown") when no transcript is found or the lookup
+    # fails. This FAILS CLOSED: the caller must not recycle on -1, so a wrong
+    # path or a transient error can never be misread as "maximally idle, safe
+    # to kill" -- which would reintroduce the active-session-kill this gate
+    # exists to prevent.
+    try {
+        $t = Get-ChildItem (Join-Path $logDir 'bridge-transcript-*.jsonl') -ErrorAction Stop |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $t) { return -1 }
+        return [int]((Get-Date) - $t.LastWriteTime).TotalSeconds
+    } catch { return -1 }
 }
 
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
@@ -212,6 +304,10 @@ while ($true) {
         '--debug-file', (QuoteArg $debugLog)
     )
 
+    # Force a fresh environment registration each launch so a server-dropped
+    # environment can never be silently reused into a ghost session.
+    Clear-BridgePointer
+
     Write-WrapLog "Launching (attempt, quickExitCount=$quickExitCount, lastHour=$recentCount): $nodeExe $($argList -join ' ')"
     $launchTime = Get-Date
     # Record the launch in persistent state BEFORE starting, so even a
@@ -241,6 +337,12 @@ while ($true) {
     $everHealthy  = $false
     $graceUntil   = (Get-Date).AddSeconds($GraceSeconds)
     $reason       = $null
+    # Start the ghost scan at the current end of debug.log so we only ever
+    # inspect output this launch appends, and advance it every iteration so a
+    # marker can't scroll past us between checks.
+    $ghostOffset  = if (Test-Path $debugLog) { (Get-Item $debugLog).Length } else { 0 }
+    $pointerWarned = $false
+    $idleUnknownWarned = $false
 
     while (-not $proc.HasExited) {
         Start-Sleep -Seconds 15
@@ -252,6 +354,14 @@ while ($true) {
             if (-not $everHealthy -and $aliveSeconds -ge $HealthyLifetimeSeconds) {
                 Write-WrapLog "Healthy: TCP:443 established and process lived ${aliveSeconds}s for PID $($proc.Id)"
                 $everHealthy = $true
+                # By now a registered session should have written its pointer.
+                # If it hasn't at the path we derived, our assumption about the
+                # CLI's pointer location is likely wrong and Clear-BridgePointer
+                # is a silent no-op -- surface that once so it's diagnosable.
+                if (-not $pointerWarned -and -not (Test-Path $bridgePointer)) {
+                    Write-WrapLog "Warning: no bridge pointer at $bridgePointer after session became healthy; fresh-registration defense may be inert (CLI pointer path may have changed)."
+                    $pointerWarned = $true
+                }
             }
         }
 
@@ -261,6 +371,43 @@ while ($true) {
                 Write-WrapLog "STALL: no TCP:443 Established for ${since}s -> killing PID $($proc.Id)"
                 try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
                 $reason = "stalled-${since}s"
+                break
+            }
+        }
+
+        # Ghost detection (primary defense): scan everything debug.log has
+        # appended since the last check for a mid-session environment reuse --
+        # the signature of a session reconnecting onto a (possibly dead)
+        # environment and polling 200 while invisible on claude.ai. The offset
+        # cursor guarantees no marker is missed regardless of log volume. We
+        # always advance the cursor, but only act once past the grace window
+        # (so the initial registration's own output is never misread).
+        $appended = Read-AppendedText -Path $debugLog -Offset $ghostOffset
+        $ghostOffset = $appended.Offset
+        if ($aliveSeconds -ge $GhostReuseGraceSeconds -and (Test-ReuseMarker $appended.Text)) {
+            Write-WrapLog "GHOST: detected mid-session environment reuse -> killing PID $($proc.Id) to re-register fresh"
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+            $reason = "ghost-reuse"
+            break
+        }
+
+        # Optional lifetime cap (off by default): a blunt fallback for a ghost
+        # the detector somehow missed. Idle-gated so it never kills a session
+        # with a conversation in flight.
+        if ($MaxSessionLifetimeSeconds -gt 0 -and $aliveSeconds -ge $MaxSessionLifetimeSeconds) {
+            $idleFor = Get-NewestTranscriptAge
+            if ($idleFor -lt 0) {
+                # Activity unknown -> fail closed (do not recycle). Warn once so
+                # a wrong/empty transcript path is diagnosable rather than
+                # silently disabling the cap.
+                if (-not $idleUnknownWarned) {
+                    Write-WrapLog "Lifetime cap reached (${aliveSeconds}s) but no transcript activity observable in $logDir; failing closed (not recycling)."
+                    $idleUnknownWarned = $true
+                }
+            } elseif ($idleFor -ge $IdleRecycleSeconds) {
+                Write-WrapLog "RECYCLE: session lived ${aliveSeconds}s and idle ${idleFor}s -> killing PID $($proc.Id) for fresh registration"
+                try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                $reason = "lifetime-recycle"
                 break
             }
         }
@@ -274,14 +421,24 @@ while ($true) {
     }
     $lifetime = [int]((Get-Date) - $launchTime).TotalSeconds
 
-    if ($everHealthy) {
+    # When a recycle/exit should NOT count toward backoff+giveup:
+    #  - the session had become healthy (a working session whose environment
+    #    was later dropped just needs to re-register -- relaunch promptly), or
+    #  - the idle lifetime cap fired (only ever past the healthy threshold).
+    # A ghost-reuse that fires *before* the session was ever healthy is treated
+    # as a real failure: it accrues quickExitCount, so a deterministically
+    # ghosting (broken) environment escalates to the GIVING UP cooldown instead
+    # of relaunching at the hourly ceiling forever.
+    $noPenaltyExit = $everHealthy -or ($reason -eq 'lifetime-recycle')
+
+    if ($noPenaltyExit) {
         if ($quickExitCount -gt 0) { Write-WrapLog "Resetting quickExitCount (was $quickExitCount)" }
         $quickExitCount = 0
     } else {
         $quickExitCount++
     }
 
-    $cooldown = if ($everHealthy) {
+    $cooldown = if ($noPenaltyExit) {
         $BaseCooldownSeconds
     } else {
         [Math]::Min($BaseCooldownSeconds * [Math]::Pow(2, $quickExitCount - 1), $MaxCooldownSeconds)
